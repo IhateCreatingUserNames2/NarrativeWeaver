@@ -1,0 +1,494 @@
+csharp
+Copy
+using UnityEngine;
+using LLMUnity;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+
+[System.Serializable]
+public class Memory
+{
+    public string id;
+    public string content;
+    public float importance; // 0-1 scale
+    public DateTime timestamp;
+    public Dictionary<string, string> metadata;
+    public float[] embedding; // Vector embedding for semantic search
+
+    public Memory(string content, float importance = 0.5f, 
+                 Dictionary<string, string> metadata = null)
+    {
+        this.id = Guid.NewGuid().ToString();
+        this.content = content;
+        this.importance = Mathf.Clamp(importance, 0f, 1f);
+        this.timestamp = DateTime.Now;
+        this.metadata = metadata ?? new Dictionary<string, string>();
+    }
+}
+
+[System.Serializable]
+public class NarrativeThread
+{
+    public string id;
+    public string name;
+    public string description;
+    public List<Memory> memories;
+    public DateTime lastAccessed;
+    public string ragGroupId; // Associated RAG group ID
+
+    public NarrativeThread(string name, string description, string ragGroupId = null)
+    {
+        this.id = Guid.NewGuid().ToString();
+        this.name = name;
+        this.description = description;
+        this.memories = new List<Memory>();
+        this.lastAccessed = DateTime.Now;
+        this.ragGroupId = ragGroupId ?? Guid.NewGuid().ToString();
+    }
+
+    public void AddMemory(Memory memory)
+    {
+        memories.Add(memory);
+        lastAccessed = DateTime.Now;
+    }
+
+    public string GetContextSummary(int maxLength = 200)
+    {
+        // Generate a concise summary of the thread's content
+        return $"{name}: {description}. Recent focus: " + 
+               string.Join(", ", memories
+                   .OrderByDescending(m => m.importance)
+                   .Take(3)
+                   .Select(m => m.content));
+    }
+}
+
+public class EnhancedNarrativeSystem : MonoBehaviour
+{
+    [Header("LLM Configuration")]
+    public LLMCharacter llmCharacter;
+    public RAG ragSystem;
+    public string characterName = "AI Companion";
+    public string characterDescription = "An AI with advanced memory capabilities";
+
+    [Header("Narrative Settings")]
+    [Tooltip("How many recent threads to keep in context")]
+    public int maxActiveThreads = 3;
+    [Tooltip("Max memories to retrieve from RAG per query")]
+    public int maxRAGMemories = 5;
+    [Tooltip("Threshold for RAG similarity score (0-1)")]
+    public float ragSimilarityThreshold = 0.6f;
+
+    private List<NarrativeThread> threads = new List<NarrativeThread>();
+    private List<string> activeThreadIds = new List<string>();
+    private List<Memory> coreMemories = new List<Memory>();
+
+    private async void Awake()
+    {
+        InitializeCoreMemories();
+        await InitializeRAGSystem();
+    }
+
+    private void InitializeCoreMemories()
+    {
+        coreMemories.Add(new Memory($"My name is {characterName}", 1f));
+        coreMemories.Add(new Memory(characterDescription, 1f));
+        coreMemories.Add(new Memory("I use advanced memory systems to maintain context", 0.9f));
+        
+        // Add core memories to RAG without a specific group
+        _ = AddMemoriesToRAG(coreMemories);
+    }
+
+    private async Task InitializeRAGSystem()
+    {
+        // Configure RAG settings
+        ragSystem.ReturnChunks(true);
+        // Wait for RAG to initialize if needed
+        await Task.Yield();
+    }
+
+    public async Task<NarrativeThread> CreateThread(string name, string description)
+    {
+        var thread = new NarrativeThread(name, description);
+        threads.Add(thread);
+        
+        // Create a dedicated RAG group for this thread
+        await ragSystem.Add(thread.description, thread.ragGroupId);
+        
+        UpdateActiveThreads(thread.id);
+        return thread;
+    }
+
+    public async Task AddMemoryToThread(string threadId, string content, 
+                                      float importance = 0.5f, 
+                                      Dictionary<string, string> metadata = null)
+    {
+        var thread = threads.FirstOrDefault(t => t.id == threadId);
+        if (thread != null)
+        {
+            var memory = new Memory(content, importance, metadata);
+            
+            // Generate embedding for the memory
+            memory.embedding = await GenerateEmbedding(content);
+            
+            thread.AddMemory(memory);
+            UpdateActiveThreads(threadId);
+            
+            // Add to RAG system with thread's group ID
+            await ragSystem.Add(content, thread.ragGroupId);
+        }
+    }
+
+    private async Task<float[]> GenerateEmbedding(string text)
+    {
+        // Use LLMUnity's embedding function
+        return (await llmCharacter.Embeddings(text))?.ToArray();
+    }
+
+    public async Task<string> GetFullContext(string userQuery = null)
+    {
+        string context = $"Character: {characterName}\nRole: {characterDescription}\n\n";
+
+        // Add core memories
+        context += "Core Knowledge:\n";
+        foreach (var memory in coreMemories)
+        {
+            context += $"- {memory.content}\n";
+        }
+
+        // Get relevant memories from RAG
+        if (!string.IsNullOrEmpty(userQuery))
+        {
+            var relevantMemories = await RetrieveRelevantMemories(userQuery);
+            if (relevantMemories.Count > 0)
+            {
+                context += "\nRelevant Memories:\n";
+                foreach (var memory in relevantMemories)
+                {
+                    context += $"- {memory.content} (from thread: {GetThreadName(memory)})\n";
+                }
+            }
+        }
+
+        // Add active thread summaries
+        context += "\nActive Narrative Threads:\n";
+        foreach (var threadId in activeThreadIds)
+        {
+            var thread = threads.FirstOrDefault(t => t.id == threadId);
+            if (thread != null)
+            {
+                context += $"- {thread.GetContextSummary()}\n";
+            }
+        }
+
+        return context;
+    }
+
+    private string GetThreadName(Memory memory)
+    {
+        return threads.FirstOrDefault(t => t.memories.Contains(memory))?.name ?? "General";
+    }
+
+    private async Task<List<Memory>> RetrieveRelevantMemories(string query, int maxMemories = 5)
+    {
+        var relevantMemories = new List<Memory>();
+        
+        // Search across all threads
+        var (results, scores) = await ragSystem.Search(query, maxMemories * 2);
+        
+        // Match RAG results with our memory objects
+        for (int i = 0; i < results.Length; i++)
+        {
+            if (scores[i] < ragSimilarityThreshold) continue;
+            
+            // Find memory with matching content
+            var memory = threads
+                .SelectMany(t => t.memories)
+                .FirstOrDefault(m => m.content == results[i]);
+            
+            if (memory != null)
+            {
+                relevantMemories.Add(memory);
+                if (relevantMemories.Count >= maxMemories) break;
+            }
+        }
+        
+        return relevantMemories;
+    }
+
+    public async Task<string> GenerateResponse(string userInput)
+    {
+        // First find relevant threads based on the input
+        var relevantThreads = await FindRelevantThreads(userInput);
+        if (relevantThreads.Count > 0)
+        {
+            UpdateActiveThreads(relevantThreads[0].id);
+        }
+
+        // Get full context augmented with RAG results
+        string context = await GetFullContext(userInput);
+
+        // Format the prompt
+        string prompt = $"{context}\n\nCurrent conversation:\nPlayer: {userInput}\n{characterName}:";
+
+        // Generate response
+        string response = await llmCharacter.Chat(prompt);
+
+        // Create memory of this interaction
+        await ProcessAndStoreInteraction(userInput, response, relevantThreads);
+
+        return response;
+    }
+
+    private async Task ProcessAndStoreInteraction(string userInput, string aiResponse, 
+                                               List<NarrativeThread> relevantThreads)
+    {
+        // Determine importance based on response length and content
+        float importance = Mathf.Clamp(aiResponse.Split(' ').Length / 50f, 0.1f, 0.9f);
+        
+        // Use the most relevant thread or create a new one
+        NarrativeThread targetThread = relevantThreads.FirstOrDefault() ?? 
+            await CreateThread("Conversation " + DateTime.Now.ToString("MM-dd"), 
+                             "General discussion");
+
+        // Store both user input and AI response
+        await AddMemoryToThread(targetThread.id, $"User asked: {userInput}", importance * 0.8f);
+        await AddMemoryToThread(targetThread.id, $"I responded: {aiResponse}", importance);
+    }
+
+    public async Task<List<NarrativeThread>> FindRelevantThreads(string query, int maxResults = 3)
+    {
+        // First try semantic search via RAG
+        var (results, scores) = await ragSystem.Search(query, maxResults * 2);
+        
+        var relevantThreads = new List<(NarrativeThread thread, float score)>();
+        
+        // Match RAG results to threads
+        foreach (var result in results)
+        {
+            var matchingThread = threads.FirstOrDefault(t => 
+                t.description.Contains(result) || 
+                t.memories.Any(m => m.content.Contains(result)));
+            
+            if (matchingThread != null)
+            {
+                var existing = relevantThreads.FirstOrDefault(x => x.thread.id == matchingThread.id);
+                if (existing.thread != null)
+                {
+                    existing.score += 1f; // Boost score for multiple matches
+                }
+                else
+                {
+                    relevantThreads.Add((matchingThread, 1f));
+                }
+            }
+        }
+        
+        // Fallback to keyword matching if semantic search finds little
+        if (relevantThreads.Count < maxResults)
+        {
+            var keywordResults = threads
+                .Select(t => (t, CalculateKeywordScore(t, query)))
+                .Where(x => x.Item2 > 0)
+                .OrderByDescending(x => x.Item2)
+                .Take(maxResults - relevantThreads.Count);
+            
+            relevantThreads.AddRange(keywordResults.Select(x => (x.t, (float)x.Item2)));
+        }
+        
+        return relevantThreads
+            .OrderByDescending(x => x.score)
+            .Take(maxResults)
+            .Select(x => x.thread)
+            .ToList();
+    }
+
+    private int CalculateKeywordScore(NarrativeThread thread, string query)
+    {
+        var queryKeywords = query.ToLower().Split(new[] { ' ', ',', '.', '!', '?' }, 
+                                                StringSplitOptions.RemoveEmptyEntries);
+        
+        var threadText = $"{thread.name} {thread.description} {string.Join(" ", 
+            thread.memories.Select(m => m.content))}";
+        
+        var threadKeywords = threadText.ToLower().Split(new[] { ' ', ',', '.', '!', '?' }, 
+                                                      StringSplitOptions.RemoveEmptyEntries);
+        
+        return queryKeywords.Sum(qk => 
+            threadKeywords.Count(tk => tk.Contains(qk) || qk.Contains(tk)));
+    }
+
+    public async Task AddMemoriesToRAG(IEnumerable<Memory> memories, string groupId = null)
+    {
+        foreach (var memory in memories)
+        {
+            await ragSystem.Add(memory.content, groupId);
+        }
+    }
+
+    // Save/Load system for persistence
+    public async Task SaveState(string saveKey)
+    {
+        // Save RAG data
+        await ragSystem.Save($"{saveKey}_rag.zip");
+        
+        // Save narrative state (simplified example)
+        var saveData = new NarrativeSaveData {
+            threads = this.threads,
+            activeThreadIds = this.activeThreadIds,
+            coreMemories = this.coreMemories
+        };
+        
+        string json = JsonUtility.ToJson(saveData);
+        PlayerPrefs.SetString(saveKey, json);
+        PlayerPrefs.Save();
+    }
+
+    public async Task LoadState(string saveKey)
+    {
+        // Load RAG data
+        await ragSystem.Load($"{saveKey}_rag.zip");
+        
+        // Load narrative state
+        if (PlayerPrefs.HasKey(saveKey))
+        {
+            string json = PlayerPrefs.GetString(saveKey);
+            var saveData = JsonUtility.FromJson<NarrativeSaveData>(json);
+            
+            this.threads = saveData.threads;
+            this.activeThreadIds = saveData.activeThreadIds;
+            this.coreMemories = saveData.coreMemories;
+            
+            // Rebuild RAG groups for threads
+            foreach (var thread in threads)
+            {
+                await AddMemoriesToRAG(thread.memories, thread.ragGroupId);
+            }
+        }
+    }
+
+    [System.Serializable]
+    private class NarrativeSaveData
+    {
+        public List<NarrativeThread> threads;
+        public List<string> activeThreadIds;
+        public List<Memory> coreMemories;
+    }
+}
+Key Enhancements with RAG Integration
+Semantic Memory Retrieval:
+
+Uses RAG's vector embeddings for finding relevant memories based on meaning rather than just keywords
+
+Memories are stored in RAG groups corresponding to narrative threads
+
+Improved Context Building:
+
+Dynamically retrieves the most relevant memories for each user query
+
+Combines semantic search results with temporal/importance weighting
+
+Enhanced Thread Management:
+
+Each thread maintains its own RAG group for isolated semantic search
+
+Thread relevance is determined through both semantic and keyword matching
+
+Embedding Generation:
+
+Automatically generates embeddings for new memories using LLMUnity's embedding function
+
+Stores embeddings with memories for potential future use
+
+Implementation Guide
+Setup Requirements:
+
+Add both LLM and RAG components to your Unity project
+
+Configure RAG with a suitable embedding model (smaller models work well for this)
+
+Initialization:
+
+csharp
+Copy
+public EnhancedNarrativeSystem narrativeSystem;
+public RAG ragSystem;
+public LLMCharacter llmCharacter;
+
+async void Start()
+{
+    // Initialize systems
+    narrativeSystem.llmCharacter = llmCharacter;
+    narrativeSystem.ragSystem = ragSystem;
+    
+    // Load saved state if available
+    await narrativeSystem.LoadState("player1_session");
+    
+    // Create initial threads
+    await narrativeSystem.CreateThread("Personal Background", 
+        "Information the user has shared about themselves");
+    await narrativeSystem.CreateThread("Current Topics", 
+        "Subjects being actively discussed");
+}
+Usage Example:
+
+csharp
+Copy
+async void ProcessPlayerInput(string input)
+{
+    // Get AI response with full narrative context
+    string response = await narrativeSystem.GenerateResponse(input);
+    
+    // Display response
+    dialogueUI.ShowResponse(response);
+    
+    // Periodically save state
+    if (Time.frameCount % 100 == 0)
+    {
+        await narrativeSystem.SaveState("player1_session");
+    }
+}
+Advanced Memory Querying:
+
+csharp
+Copy
+async void QuerySpecificMemory(string question)
+{
+    // Directly query the RAG system for precise information
+    var (results, scores) = await narrativeSystem.ragSystem.Search(question, 3);
+    
+    // Present the most relevant information
+    if (results.Length > 0 && scores[0] > 0.6f)
+    {
+        string answer = $"I remember: {results[0]}";
+        dialogueUI.ShowResponse(answer);
+    }
+    else
+    {
+        dialogueUI.ShowResponse("I don't have clear memories about that");
+    }
+}
+Performance Considerations
+RAG Optimization:
+
+Use smaller embedding models for faster performance
+
+Limit the number of memories stored in RAG (keep older memories in cold storage)
+
+Set appropriate chunking sizes in the RAG component
+
+Memory Management:
+
+Implement memory pruning to remove low-importance old memories
+
+Consider periodically summarizing groups of memories into single summary memories
+
+Asynchronous Operations:
+
+Always use await with LLM and RAG operations
+
+Provide loading indicators during memory operations
+
+Consider implementing a task queue for memory updates
